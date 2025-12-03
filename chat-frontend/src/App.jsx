@@ -1,66 +1,65 @@
 // frontend/src/App.jsx
-import React, { useEffect, useState, useMemo } from "react";
+import React, { useEffect, useState } from "react";
 import { io } from "socket.io-client";
 import axios from "axios";
 
 const API_BASE = "http://localhost:4000";
-
-const socket = io(API_BASE, {
-  autoConnect: false, // we'll connect after we know the user
-});
+const socket = io(API_BASE, { autoConnect: false });
 
 function App() {
-  const [user, setUser] = useState(null); // { _id, username }
+  const [user, setUser] = useState(null); // {_id, username}
   const [usernameInput, setUsernameInput] = useState("");
   const [onlineUsers, setOnlineUsers] = useState([]); // [{userId, username}]
-  const [activeUser, setActiveUser] = useState(null); // {userId, username}
-  const [messages, setMessages] = useState([]); // current conversation
+  
+  const [activeUser, setActiveUser] = useState(null); // private chat
+  const [activeRoom, setActiveRoom] = useState(null); // room chat
+
+  const [messages, setMessages] = useState([]);
   const [messageInput, setMessageInput] = useState("");
   const [loadingMessages, setLoadingMessages] = useState(false);
 
-  // Connect socket only after user is set
+  const [rooms, setRooms] = useState([]);
+  const [newRoomName, setNewRoomName] = useState("");
+
+  // ------------------ SOCKET SETUP ------------------
   useEffect(() => {
     if (!user) return;
-
     socket.auth = { userId: user._id, username: user.username };
     socket.connect();
 
-    // Receive updated online users
-    socket.on("onlineUsers", (list) => {
-      setOnlineUsers(list);
+    socket.on("onlineUsers", setOnlineUsers);
+
+    socket.on("privateMessage", (msg) => {
+      if (
+        (msg.from === user._id && msg.to === activeUser?.userId) ||
+        (msg.to === user._id && msg.from === activeUser?.userId)
+      ) {
+        setMessages((prev) => [...prev, msg]);
+      }
     });
 
-    // Receive private messages
-    socket.on("privateMessage", (msg) => {
-      // Only add message if it belongs to current open conversation
-      setMessages((prev) => {
-        if (
-          (msg.from === user._id && msg.to === activeUser?.userId) ||
-          (msg.to === user._id && msg.from === activeUser?.userId)
-        ) {
-          return [...prev, msg];
-        }
-        return prev;
-      });
+    socket.on("roomMessage", (msg) => {
+      if (msg.roomId === activeRoom?._id) {
+        setMessages((prev) => [...prev, msg]);
+      }
     });
 
     return () => {
       socket.off("onlineUsers");
       socket.off("privateMessage");
+      socket.off("roomMessage");
       socket.disconnect();
     };
-  }, [user, activeUser?.userId]);
+  }, [user, activeUser, activeRoom]);
 
-  // Handle username submit (register/login)
+  // ------------------ LOGIN ------------------
   const handleLogin = async (e) => {
     e.preventDefault();
     const trimmed = usernameInput.trim();
     if (!trimmed) return;
 
     try {
-      const res = await axios.post(`${API_BASE}/api/users`, {
-        username: trimmed,
-      });
+      const res = await axios.post(`${API_BASE}/api/users`, { username: trimmed });
       setUser(res.data);
     } catch (err) {
       console.error(err);
@@ -68,43 +67,97 @@ function App() {
     }
   };
 
-  // Load conversation when activeUser changes
+  // ------------------ LOAD ROOMS ------------------
+  useEffect(() => {
+    if (!user) return;
+    const fetchRooms = async () => {
+      try {
+        const res = await axios.get(`${API_BASE}/api/rooms`, {
+          params: { userId: user._id },
+        });
+        setRooms(res.data);
+      } catch (err) {
+        console.error(err);
+      }
+    };
+    fetchRooms();
+  }, [user]);
+
+  // ------------------ LOAD MESSAGES ------------------
   useEffect(() => {
     const fetchMessages = async () => {
-      if (!user || !activeUser) return;
+      if (!user) return;
       setLoadingMessages(true);
       try {
-        const res = await axios.get(`${API_BASE}/api/messages`, {
-          params: { from: user._id, to: activeUser.userId },
-        });
-        setMessages(res.data);
+        let res;
+        if (activeUser) {
+          res = await axios.get(`${API_BASE}/api/messages`, {
+            params: { from: user._id, to: activeUser.userId },
+          });
+        } else if (activeRoom) {
+          res = await axios.get(`${API_BASE}/api/messages/room/${activeRoom._id}`);
+        }
+        setMessages(res?.data || []);
       } catch (err) {
         console.error(err);
       } finally {
         setLoadingMessages(false);
       }
     };
-
     fetchMessages();
-  }, [user, activeUser]);
+  }, [activeUser, activeRoom, user]);
 
+  // ------------------ SEND MESSAGE ------------------
   const handleSendMessage = (e) => {
     e.preventDefault();
-    if (!messageInput.trim() || !activeUser) return;
+    if (!messageInput.trim()) return;
 
-    socket.emit("privateMessage", {
-      toUserId: activeUser.userId,
-      content: messageInput.trim(),
-    });
+    if (activeUser) {
+      socket.emit("privateMessage", {
+        toUserId: activeUser.userId,
+        content: messageInput.trim(),
+      });
+    } else if (activeRoom) {
+      socket.emit("roomMessage", {
+        roomId: activeRoom._id,
+        content: messageInput.trim(),
+      });
+    }
 
     setMessageInput("");
   };
 
+  // ------------------ CREATE ROOM ------------------
+  const handleCreateRoom = async () => {
+    const trimmed = newRoomName.trim();
+    if (!trimmed) return;
+    try {
+      const res = await axios.post(`${API_BASE}/api/rooms`, {
+        name: trimmed,
+        members: [user._id],
+      });
+      setRooms((prev) => [...prev, res.data]);
+      setNewRoomName("");
+    } catch (err) {
+      console.error(err);
+      alert("Failed to create room");
+    }
+  };
+
+  // ------------------ JOIN ROOM ------------------
+  useEffect(() => {
+    if (activeRoom) {
+      socket.emit("joinRoom", activeRoom._id);
+      setActiveUser(null); // deselect private chat
+    }
+  }, [activeRoom]);
+
   const isLoggedIn = !!user;
 
+  // ------------------ UI ------------------
   return (
     <div style={styles.app}>
-      {/* Left: sidebar */}
+      {/* Sidebar */}
       <div style={styles.sidebar}>
         {!isLoggedIn ? (
           <form onSubmit={handleLogin} style={styles.loginForm}>
@@ -116,56 +169,83 @@ function App() {
               onChange={(e) => setUsernameInput(e.target.value)}
               style={styles.input}
             />
-            <button type="submit" style={styles.button}>
-              Continue
-            </button>
+            <button type="submit" style={styles.button}>Continue</button>
           </form>
         ) : (
           <div style={styles.userBox}>
-            <div>
-              Logged in as: <strong>{user.username}</strong>
-            </div>
+            Logged in as: <strong>{user.username}</strong>
           </div>
         )}
 
-        <h3 style={{ marginLeft: 10 }}>Online Users</h3>
-        <div style={styles.usersList}>
-          {onlineUsers.length === 0 && <p style={{ padding: 10 }}>No one online</p>}
-          {onlineUsers.map((u) => (
-            <div
-              key={u.userId}
-              style={{
-                ...styles.userItem,
-                backgroundColor:
-                  activeUser?.userId === u.userId ? "#007bff" : "transparent",
-                color: activeUser?.userId === u.userId ? "#fff" : "#000",
-                fontStyle: u.userId === user?._id ? "italic" : "normal",
-              }}
-              onClick={() => {
-                if (u.userId === user?._id) return;
-                setActiveUser(u);
-              }}
-            >
-              {u.username}
-              {u.userId === user?._id ? " (You)" : ""}
+        {/* Rooms */}
+        {isLoggedIn && (
+          <>
+            <h3 style={{ marginLeft: 10 }}>Rooms</h3>
+            <div style={styles.usersList}>
+              {rooms.map((r) => (
+                <div
+                  key={r._id}
+                  style={{
+                    ...styles.userItem,
+                    backgroundColor: activeRoom?._id === r._id ? "#007bff" : "transparent",
+                    color: activeRoom?._id === r._id ? "#fff" : "#000",
+                  }}
+                  onClick={() => setActiveRoom(r)}
+                >
+                  {r.name}
+                </div>
+              ))}
+              <div style={{ display: "flex", padding: 5 }}>
+                <input
+                  type="text"
+                  placeholder="New room..."
+                  value={newRoomName}
+                  onChange={(e) => setNewRoomName(e.target.value)}
+                  style={{ flex: 1, marginRight: 5, padding: "4px 6px", borderRadius: 4, border: "1px solid #ccc" }}
+                />
+                <button onClick={handleCreateRoom} style={styles.button}>+</button>
+              </div>
             </div>
-          ))}
-        </div>
+          </>
+        )}
+
+        {/* Online Users */}
+        {isLoggedIn && (
+          <>
+            <h3 style={{ marginLeft: 10 }}>Online Users</h3>
+            <div style={styles.usersList}>
+              {onlineUsers.map((u) => (
+                <div
+                  key={u.userId}
+                  style={{
+                    ...styles.userItem,
+                    backgroundColor: activeUser?.userId === u.userId ? "#007bff" : "transparent",
+                    color: activeUser?.userId === u.userId ? "#fff" : "#000",
+                    fontStyle: u.userId === user?._id ? "italic" : "normal",
+                  }}
+                  onClick={() => u.userId !== user._id && setActiveUser(u)}
+                >
+                  {u.username}{u.userId === user._id ? " (You)" : ""}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
       </div>
 
-      {/* Right: main chat area */}
+      {/* Main Chat Area */}
       <div style={styles.main}>
         {!isLoggedIn ? (
           <div style={styles.centerMessage}>Please login to start chatting.</div>
-        ) : !activeUser ? (
-          <div style={styles.centerMessage}>
-            Select an online user from the left to start a private chat.
-          </div>
+        ) : (!activeUser && !activeRoom) ? (
+          <div style={styles.centerMessage}>Select a user or room to chat.</div>
         ) : (
           <>
             <div style={styles.chatHeader}>
-              Chat with: <strong>{activeUser.username}</strong>
+              {activeUser && <>Chat with: <strong>{activeUser.username}</strong></>}
+              {activeRoom && <>Room: <strong>{activeRoom.name}</strong></>}
             </div>
+
             <div style={styles.chatArea}>
               {loadingMessages ? (
                 <div style={styles.centerMessage}>Loading messages...</div>
@@ -219,86 +299,20 @@ function App() {
 }
 
 const styles = {
-  app: {
-    display: "flex",
-    height: "100vh",
-    fontFamily: "sans-serif",
-  },
-  sidebar: {
-    width: 260,
-    borderRight: "1px solid #ddd",
-    display: "flex",
-    flexDirection: "column",
-  },
-  loginForm: {
-    padding: 10,
-    display: "flex",
-    flexDirection: "column",
-    gap: 8,
-  },
-  userBox: {
-    padding: 10,
-    borderBottom: "1px solid #ddd",
-  },
-  usersList: {
-    flex: 1,
-    overflowY: "auto",
-  },
-  userItem: {
-    padding: "8px 10px",
-    cursor: "pointer",
-    borderBottom: "1px solid #eee",
-  },
-  main: {
-    flex: 1,
-    display: "flex",
-    flexDirection: "column",
-  },
-  chatHeader: {
-    padding: 10,
-    borderBottom: "1px solid #ddd",
-    backgroundColor: "#f7f7f7",
-  },
-  chatArea: {
-    flex: 1,
-    padding: 10,
-    display: "flex",
-    flexDirection: "column",
-    gap: 6,
-    overflowY: "auto",
-  },
-  messageForm: {
-    display: "flex",
-    gap: 8,
-    padding: 10,
-    borderTop: "1px solid #ddd",
-  },
-  input: {
-    flex: 1,
-    padding: "8px 10px",
-    borderRadius: 4,
-    border: "1px solid #ccc",
-  },
-  button: {
-    padding: "8px 14px",
-    borderRadius: 4,
-    border: "none",
-    backgroundColor: "#007bff",
-    color: "#fff",
-    cursor: "pointer",
-  },
-  centerMessage: {
-    flex: 1,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    color: "#777",
-  },
-  message: {
-    maxWidth: "70%",
-    padding: "6px 8px",
-    borderRadius: 6,
-  },
+  app: { display: "flex", height: "100vh", fontFamily: "sans-serif" },
+  sidebar: { width: 260, borderRight: "1px solid #ddd", display: "flex", flexDirection: "column" },
+  loginForm: { padding: 10, display: "flex", flexDirection: "column", gap: 8 },
+  userBox: { padding: 10, borderBottom: "1px solid #ddd" },
+  usersList: { flex: 1, overflowY: "auto" },
+  userItem: { padding: "8px 10px", cursor: "pointer", borderBottom: "1px solid #eee" },
+  main: { flex: 1, display: "flex", flexDirection: "column" },
+  chatHeader: { padding: 10, borderBottom: "1px solid #ddd", backgroundColor: "#f7f7f7" },
+  chatArea: { flex: 1, padding: 10, display: "flex", flexDirection: "column", gap: 6, overflowY: "auto" },
+  messageForm: { display: "flex", gap: 8, padding: 10, borderTop: "1px solid #ddd" },
+  input: { flex: 1, padding: "8px 10px", borderRadius: 4, border: "1px solid #ccc" },
+  button: { padding: "8px 14px", borderRadius: 4, border: "none", backgroundColor: "#007bff", color: "#fff", cursor: "pointer" },
+  centerMessage: { flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#777" },
+  message: { maxWidth: "70%", padding: "6px 8px", borderRadius: 6 },
 };
 
 export default App;
