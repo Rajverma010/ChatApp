@@ -19,7 +19,11 @@ const io = new Server(server, {
   },
 });
 
-app.use(cors({ origin: "http://localhost:5173" }));
+app.use(
+  cors({
+    origin: "http://localhost:5173",
+  })
+);
 app.use(express.json());
 
 // --- MongoDB connection ---
@@ -44,11 +48,12 @@ app.post("/api/users", async (req, res) => {
   }
 });
 
-// --- Get conversation between two users ---
+// --- Get conversation between two users (private chat) ---
 app.get("/api/messages", async (req, res) => {
   try {
     const { from, to } = req.query;
-    if (!from || !to) return res.status(400).json({ error: "from and to are required" });
+    if (!from || !to)
+      return res.status(400).json({ error: "from and to are required" });
 
     const messages = await Message.find({
       $or: [
@@ -74,14 +79,17 @@ app.get("/api/messages/room/:roomId", async (req, res) => {
       .sort({ createdAt: 1 })
       .populate("from", "username")
       .lean();
-    res.json(messages.map(msg => ({
-      _id: msg._id,
-      content: msg.content,
-      roomId: msg.room,
-      from: msg.from._id,
-      fromUsername: msg.from.username,
-      createdAt: msg.createdAt
-    })));
+
+    res.json(
+      messages.map((msg) => ({
+        _id: msg._id,
+        content: msg.content,
+        roomId: msg.room,
+        from: msg.from._id,
+        fromUsername: msg.from.username,
+        createdAt: msg.createdAt,
+      }))
+    );
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -93,7 +101,9 @@ app.post("/api/rooms", async (req, res) => {
   try {
     const { name, members } = req.body;
     if (!name) return res.status(400).json({ error: "Room name required" });
-    const room = await Room.create({ name, members });
+
+    // you can store members if you want, but it's not required for basic joining
+    const room = await Room.create({ name, members: members || [] });
     res.json(room);
   } catch (err) {
     console.error(err);
@@ -101,17 +111,19 @@ app.post("/api/rooms", async (req, res) => {
   }
 });
 
-// --- List all rooms for a user ---
+// --- Get ALL rooms (important so everyone can see & join) ---
+// --- List all rooms (everyone can see & join) ---
 app.get("/api/rooms", async (req, res) => {
   try {
-    const { userId } = req.query;
-    const rooms = await Room.find({ members: userId }).lean();
+    // ❌ Don't filter by members or userId here
+    const rooms = await Room.find().lean();
     res.json(rooms);
   } catch (err) {
-    console.error(err);
+    console.error("GET /api/rooms error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
+
 
 // --- Online users store ---
 const onlineUsers = new Map(); // userId -> socketId
@@ -145,6 +157,7 @@ io.on("connection", (socket) => {
         to: toUserId,
         content,
       });
+
       const populatedMsg = await msg.populate("from to", "username");
       const payload = {
         _id: populatedMsg._id,
@@ -157,8 +170,11 @@ io.on("connection", (socket) => {
       };
 
       socket.emit("privateMessage", payload);
+
       const receiverSocketId = onlineUsers.get(toUserId);
-      if (receiverSocketId) io.to(receiverSocketId).emit("privateMessage", payload);
+      if (receiverSocketId) {
+        io.to(receiverSocketId).emit("privateMessage", payload);
+      }
     } catch (err) {
       console.error(err);
     }
@@ -174,6 +190,7 @@ io.on("connection", (socket) => {
         room: roomId,
         content,
       });
+
       const populatedMsg = await msg.populate("from", "username");
       const payload = {
         _id: populatedMsg._id,
@@ -183,13 +200,15 @@ io.on("connection", (socket) => {
         roomId,
         createdAt: populatedMsg.createdAt,
       };
-      io.to(roomId).emit("roomMessage", payload); // emit to room
+
+      // send to everyone who joined this room via socket.join(roomId)
+      io.to(roomId).emit("roomMessage", payload);
     } catch (err) {
       console.error(err);
     }
   });
 
-  // --- Join a room ---
+  // --- Join a room (socket.io room) ---
   socket.on("joinRoom", (roomId) => {
     socket.join(roomId);
     console.log(`${socket.username} joined room ${roomId}`);
@@ -216,4 +235,6 @@ function broadcastOnlineUsers() {
 }
 
 const PORT = 4000;
-server.listen(PORT, () => console.log(`Server listening on http://localhost:${PORT}`));
+server.listen(PORT, () =>
+  console.log(`Server listening on http://localhost:${PORT}`)
+);

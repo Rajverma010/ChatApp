@@ -1,18 +1,95 @@
 // frontend/src/App.jsx
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef, useMemo } from "react";
 import { io } from "socket.io-client";
 import axios from "axios";
+
+import {
+  AppBar,
+  Toolbar,
+  Typography,
+  Box,
+  Paper,
+  TextField,
+  Button,
+  List,
+  ListItemButton,
+  ListItemText,
+  Divider,
+  Stack,
+  IconButton,
+  Chip,
+  Avatar,
+  CircularProgress,
+  CssBaseline,
+  useMediaQuery,
+} from "@mui/material";
+
+import { ThemeProvider, createTheme } from "@mui/material/styles";
+
+import SendIcon from "@mui/icons-material/Send";
+import AddIcon from "@mui/icons-material/Add";
+import GroupIcon from "@mui/icons-material/Group";
 
 const API_BASE = "http://localhost:4000";
 const socket = io(API_BASE, { autoConnect: false });
 
+// Helper to generate a consistent color for user avatars
+const stringToColor = (string = "") => {
+  if (!string) return "#888888";
+  let hash = 0;
+  for (let i = 0; i < string.length; i++) {
+    hash = string.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  let color = "#";
+  for (let i = 0; i < 3; i++) {
+    const value = (hash >> (i * 8)) & 0xff;
+    color += ("00" + value.toString(16)).slice(-2);
+  }
+  return color;
+};
+
+/**
+ * Outer App: handles theme & full-screen layout
+ */
 function App() {
+  // auto detect system theme
+  const prefersDarkMode = useMediaQuery("(prefers-color-scheme: dark)");
+
+  const theme = useMemo(
+    () =>
+      createTheme({
+        palette: {
+          mode: prefersDarkMode ? "dark" : "light",
+          primary: {
+            main: "#3498db",
+          },
+          background: {
+            default: prefersDarkMode ? "#121212" : "#f0f2f5",
+            paper: prefersDarkMode ? "#1e1e1e" : "#ffffff",
+          },
+        },
+      }),
+    [prefersDarkMode]
+  );
+
+  return (
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+      <ChatApp />
+    </ThemeProvider>
+  );
+}
+
+/**
+ * Inner component: your original chat logic + UI
+ */
+function ChatApp() {
   const [user, setUser] = useState(null); // {_id, username}
   const [usernameInput, setUsernameInput] = useState("");
   const [onlineUsers, setOnlineUsers] = useState([]); // [{userId, username}]
-  
-  const [activeUser, setActiveUser] = useState(null); // private chat
-  const [activeRoom, setActiveRoom] = useState(null); // room chat
+
+  const [activeUser, setActiveUser] = useState(null); // private chat target
+  const [activeRoom, setActiveRoom] = useState(null); // current room
 
   const [messages, setMessages] = useState([]);
   const [messageInput, setMessageInput] = useState("");
@@ -21,9 +98,18 @@ function App() {
   const [rooms, setRooms] = useState([]);
   const [newRoomName, setNewRoomName] = useState("");
 
+  // Ref for auto-scroll
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+  useEffect(scrollToBottom, [messages]);
+
   // ------------------ SOCKET SETUP ------------------
   useEffect(() => {
     if (!user) return;
+
     socket.auth = { userId: user._id, username: user.username };
     socket.connect();
 
@@ -59,7 +145,9 @@ function App() {
     if (!trimmed) return;
 
     try {
-      const res = await axios.post(`${API_BASE}/api/users`, { username: trimmed });
+      const res = await axios.post(`${API_BASE}/api/users`, {
+        username: trimmed,
+      });
       setUser(res.data);
     } catch (err) {
       console.error(err);
@@ -72,9 +160,7 @@ function App() {
     if (!user) return;
     const fetchRooms = async () => {
       try {
-        const res = await axios.get(`${API_BASE}/api/rooms`, {
-          params: { userId: user._id },
-        });
+        const res = await axios.get(`${API_BASE}/api/rooms`); // all rooms
         setRooms(res.data);
       } catch (err) {
         console.error(err);
@@ -86,7 +172,10 @@ function App() {
   // ------------------ LOAD MESSAGES ------------------
   useEffect(() => {
     const fetchMessages = async () => {
-      if (!user) return;
+      if (!user || (!activeUser && !activeRoom)) {
+        setMessages([]);
+        return;
+      }
       setLoadingMessages(true);
       try {
         let res;
@@ -95,7 +184,9 @@ function App() {
             params: { from: user._id, to: activeUser.userId },
           });
         } else if (activeRoom) {
-          res = await axios.get(`${API_BASE}/api/messages/room/${activeRoom._id}`);
+          res = await axios.get(
+            `${API_BASE}/api/messages/room/${activeRoom._id}`
+          );
         }
         setMessages(res?.data || []);
       } catch (err) {
@@ -110,27 +201,30 @@ function App() {
   // ------------------ SEND MESSAGE ------------------
   const handleSendMessage = (e) => {
     e.preventDefault();
-    if (!messageInput.trim()) return;
+    const text = messageInput.trim();
+    if (!text) return;
 
     if (activeUser) {
+      // just emit; server will save and send back to both
       socket.emit("privateMessage", {
         toUserId: activeUser.userId,
-        content: messageInput.trim(),
+        content: text,
       });
     } else if (activeRoom) {
       socket.emit("roomMessage", {
         roomId: activeRoom._id,
-        content: messageInput.trim(),
+        content: text,
       });
     }
 
+    // clear input; do NOT push to messages here
     setMessageInput("");
   };
 
   // ------------------ CREATE ROOM ------------------
   const handleCreateRoom = async () => {
     const trimmed = newRoomName.trim();
-    if (!trimmed) return;
+    if (!trimmed || !user) return;
     try {
       const res = await axios.post(`${API_BASE}/api/rooms`, {
         name: trimmed,
@@ -144,175 +238,435 @@ function App() {
     }
   };
 
-  // ------------------ JOIN ROOM ------------------
+  // ------------------ SELECT ROOM ------------------
+  const handleSelectRoom = (room) => {
+    setActiveUser(null);
+    setActiveRoom(room);
+  };
+
+  // ------------------ SELECT USER ------------------
+  const handleSelectUser = (u) => {
+    if (u.userId === user._id) return;
+    setActiveRoom(null);
+    setActiveUser(u);
+  };
+
+  // ------------------ JOIN ROOM (SOCKET) ------------------
   useEffect(() => {
     if (activeRoom) {
       socket.emit("joinRoom", activeRoom._id);
-      setActiveUser(null); // deselect private chat
     }
   }, [activeRoom]);
 
   const isLoggedIn = !!user;
 
   // ------------------ UI ------------------
+
+  // Login UI – full screen
+  if (!isLoggedIn) {
+    return (
+      <Box
+        sx={{
+          minHeight: "100vh",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          p: 2,
+        }}
+      >
+        <Paper
+          elevation={6}
+          sx={{ p: 5, width: "100%", maxWidth: 450, borderRadius: 3 }}
+          component="form"
+          onSubmit={handleLogin}
+        >
+          <Typography variant="h4" align="center" mb={1} color="primary">
+            ChatApp 💬
+          </Typography>
+          <Typography
+            variant="body1"
+            align="center"
+            mb={4}
+            color="text.secondary"
+          >
+            Sign in to start messaging.
+          </Typography>
+          <TextField
+            label="Username"
+            variant="outlined"
+            fullWidth
+            value={usernameInput}
+            onChange={(e) => setUsernameInput(e.target.value)}
+            margin="normal"
+            autoFocus
+          />
+          <Button
+            type="submit"
+            variant="contained"
+            fullWidth
+            sx={{ mt: 3, py: 1.5 }}
+          >
+            Enter Chat
+          </Button>
+        </Paper>
+      </Box>
+    );
+  }
+
+  // Logged-in full-screen layout
   return (
-    <div style={styles.app}>
-      {/* Sidebar */}
-      <div style={styles.sidebar}>
-        {!isLoggedIn ? (
-          <form onSubmit={handleLogin} style={styles.loginForm}>
-            <h2>Login / Register</h2>
-            <input
-              type="text"
-              placeholder="Enter username"
-              value={usernameInput}
-              onChange={(e) => setUsernameInput(e.target.value)}
-              style={styles.input}
-            />
-            <button type="submit" style={styles.button}>Continue</button>
-          </form>
-        ) : (
-          <div style={styles.userBox}>
-            Logged in as: <strong>{user.username}</strong>
-          </div>
-        )}
+    <Box sx={{ display: "flex", flexDirection: "column", minHeight: "100vh" }}>
+      <AppBar position="static" color="primary" elevation={1}>
+        <Toolbar sx={{ justifyContent: "space-between" }}>
+          <Typography variant="h6" color="inherit">
+            ChatApp
+          </Typography>
+          <Stack direction="row" spacing={1} alignItems="center">
+            <Avatar sx={{ bgcolor: stringToColor(user.username) }}>
+              {user.username.charAt(0).toUpperCase()}
+            </Avatar>
+            <Typography variant="body1" color="inherit">
+              {user.username}
+            </Typography>
+          </Stack>
+        </Toolbar>
+      </AppBar>
 
-        {/* Rooms */}
-        {isLoggedIn && (
-          <>
-            <h3 style={{ marginLeft: 10 }}>Rooms</h3>
-            <div style={styles.usersList}>
-              {rooms.map((r) => (
-                <div
-                  key={r._id}
-                  style={{
-                    ...styles.userItem,
-                    backgroundColor: activeRoom?._id === r._id ? "#007bff" : "transparent",
-                    color: activeRoom?._id === r._id ? "#fff" : "#000",
-                  }}
-                  onClick={() => setActiveRoom(r)}
-                >
-                  {r.name}
-                </div>
-              ))}
-              <div style={{ display: "flex", padding: 5 }}>
-                <input
-                  type="text"
-                  placeholder="New room..."
-                  value={newRoomName}
-                  onChange={(e) => setNewRoomName(e.target.value)}
-                  style={{ flex: 1, marginRight: 5, padding: "4px 6px", borderRadius: 4, border: "1px solid #ccc" }}
-                />
-                <button onClick={handleCreateRoom} style={styles.button}>+</button>
-              </div>
-            </div>
-          </>
-        )}
+      <Box sx={{ display: "flex", flex: 1, minHeight: 0 }}>
+        {/* --- LEFT SIDEBAR --- */}
+        <Box
+          sx={{
+            width: 300,
+            borderRight: "1px solid",
+            borderColor: "divider",
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
+          {/* Rooms Section */}
+          <Box sx={{ p: 2 }}>
+            <Typography
+              variant="overline"
+              fontWeight={700}
+              color="text.secondary"
+            >
+              Rooms
+            </Typography>
+            <List dense disablePadding sx={{ mt: 1 }}>
+              {rooms.map((r) => {
+                const selected = activeRoom?._id === r._id;
+                return (
+                  <ListItemButton
+                    key={r._id}
+                    selected={selected}
+                    onClick={() => handleSelectRoom(r)}
+                    sx={{
+                      borderRadius: 1,
+                      mb: 0.5,
+                      "&.Mui-selected": {
+                        bgcolor: "primary.light",
+                        color: "primary.contrastText",
+                        "& .MuiListItemText-primary": {
+                          fontWeight: 600,
+                        },
+                      },
+                    }}
+                  >
+                    <GroupIcon
+                      fontSize="small"
+                      sx={{ mr: 1, opacity: 0.8 }}
+                    />
+                    <ListItemText
+                      primary={r.name || "Unnamed room"}
+                      primaryTypographyProps={{ color: "text.primary" }}
+                    />
+                  </ListItemButton>
+                );
+              })}
+            </List>
 
-        {/* Online Users */}
-        {isLoggedIn && (
-          <>
-            <h3 style={{ marginLeft: 10 }}>Online Users</h3>
-            <div style={styles.usersList}>
-              {onlineUsers.map((u) => (
-                <div
-                  key={u.userId}
-                  style={{
-                    ...styles.userItem,
-                    backgroundColor: activeUser?.userId === u.userId ? "#007bff" : "transparent",
-                    color: activeUser?.userId === u.userId ? "#fff" : "#000",
-                    fontStyle: u.userId === user?._id ? "italic" : "normal",
-                  }}
-                  onClick={() => u.userId !== user._id && setActiveUser(u)}
-                >
-                  {u.username}{u.userId === user._id ? " (You)" : ""}
-                </div>
-              ))}
-            </div>
-          </>
-        )}
-      </div>
+            {/* New Room Input */}
+            <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
+              <TextField
+                size="small"
+                fullWidth
+                placeholder="New room..."
+                value={newRoomName}
+                onChange={(e) => setNewRoomName(e.target.value)}
+                variant="outlined"
+              />
+              <IconButton
+                color="primary"
+                onClick={handleCreateRoom}
+                disabled={!newRoomName.trim()}
+                size="small"
+              >
+                <AddIcon />
+              </IconButton>
+            </Stack>
+          </Box>
 
-      {/* Main Chat Area */}
-      <div style={styles.main}>
-        {!isLoggedIn ? (
-          <div style={styles.centerMessage}>Please login to start chatting.</div>
-        ) : (!activeUser && !activeRoom) ? (
-          <div style={styles.centerMessage}>Select a user or room to chat.</div>
-        ) : (
-          <>
-            <div style={styles.chatHeader}>
-              {activeUser && <>Chat with: <strong>{activeUser.username}</strong></>}
-              {activeRoom && <>Room: <strong>{activeRoom.name}</strong></>}
-            </div>
+          <Divider sx={{ mx: 2 }} />
 
-            <div style={styles.chatArea}>
-              {loadingMessages ? (
-                <div style={styles.centerMessage}>Loading messages...</div>
-              ) : messages.length === 0 ? (
-                <div style={styles.centerMessage}>No messages yet. Say hi 👋</div>
-              ) : (
-                messages.map((msg) => {
-                  const isMe = msg.from === user._id;
-                  const time = new Date(msg.createdAt).toLocaleTimeString();
-                  return (
-                    <div
-                      key={msg._id}
-                      style={{
-                        ...styles.message,
-                        alignSelf: isMe ? "flex-end" : "flex-start",
-                        backgroundColor: isMe ? "#d1ffd1" : "#f1f1f1",
-                        textAlign: isMe ? "right" : "left",
+          {/* Online Users Section */}
+          <Box sx={{ p: 2, flex: 1, overflowY: "auto" }}>
+            <Typography
+              variant="overline"
+              fontWeight={700}
+              color="text.secondary"
+            >
+              Online Users
+            </Typography>
+            <List dense disablePadding sx={{ mt: 1 }}>
+              {onlineUsers.map((u) => {
+                const selected = activeUser?.userId === u.userId;
+                const isMe = u.userId === user._id;
+
+                return (
+                  <ListItemButton
+                    key={u.userId}
+                    selected={selected}
+                    disabled={isMe}
+                    onClick={() => handleSelectUser(u)}
+                    sx={{
+                      borderRadius: 1,
+                      mb: 0.5,
+                      "&.Mui-selected": {
+                        bgcolor: "primary.light",
+                        color: "primary.contrastText",
+                        "& .MuiListItemText-primary": {
+                          fontWeight: 600,
+                        },
+                      },
+                    }}
+                  >
+                    <Avatar
+                      sx={{
+                        width: 24,
+                        height: 24,
+                        mr: 1,
+                        bgcolor: stringToColor(u.username),
                       }}
                     >
-                      <div style={{ fontSize: 12, opacity: 0.7 }}>
-                        {msg.fromUsername} • {time}
-                      </div>
-                      <div>{msg.content}</div>
-                    </div>
-                  );
-                })
-              )}
-            </div>
+                      {u.username.charAt(0).toUpperCase()}
+                    </Avatar>
+                    <ListItemText
+                      primary={u.username}
+                      primaryTypographyProps={{ color: "text.primary" }}
+                    />
+                    {isMe && (
+                      <Chip
+                        label="You"
+                        size="small"
+                        color="primary"
+                        variant="outlined"
+                        sx={{ ml: 1, height: 18 }}
+                      />
+                    )}
+                  </ListItemButton>
+                );
+              })}
+            </List>
+          </Box>
+        </Box>
 
-            <form onSubmit={handleSendMessage} style={styles.messageForm}>
-              <input
-                type="text"
-                placeholder="Type a message..."
-                value={messageInput}
-                onChange={(e) => setMessageInput(e.target.value)}
-                style={styles.input}
-              />
-              <button
-                type="submit"
-                style={styles.button}
-                disabled={!messageInput.trim()}
+        {/* --- MAIN CHAT AREA --- */}
+        <Box
+          sx={{
+            flex: 1,
+            display: "flex",
+            flexDirection: "column",
+            minWidth: 0,
+          }}
+        >
+          {/* Chat Header */}
+          <Box
+            sx={{
+              p: 2,
+              borderBottom: "1px solid",
+              borderColor: "divider",
+              display: "flex",
+              alignItems: "center",
+              bgcolor: "background.paper",
+            }}
+          >
+            {activeUser || activeRoom ? (
+              <Stack direction="row" alignItems="center" spacing={2}>
+                <Avatar
+                  sx={{
+                    bgcolor: stringToColor(
+                      activeUser?.username || activeRoom?.name
+                    ),
+                  }}
+                >
+                  {(activeUser?.username || activeRoom?.name || "?")
+                    .charAt(0)
+                    .toUpperCase()}
+                </Avatar>
+                <Typography variant="h6" fontWeight={600} color="text.primary">
+                  {activeUser ? activeUser.username : activeRoom.name}
+                </Typography>
+              </Stack>
+            ) : (
+              <Typography variant="h6" color="text.secondary">
+                Select a room or user to start chatting 🚀
+              </Typography>
+            )}
+          </Box>
+
+          {/* Messages */}
+          <Box
+            sx={{
+              flex: 1,
+              overflowY: "auto",
+              p: 3,
+              backgroundImage:
+                "linear-gradient(to top, rgba(0,0,0,0.02), transparent)",
+            }}
+          >
+            {loadingMessages ? (
+              <Box
+                sx={{
+                  height: "100%",
+                  display: "flex",
+                  justifyContent: "center",
+                  alignItems: "center",
+                }}
               >
-                Send
-              </button>
-            </form>
-          </>
-        )}
-      </div>
-    </div>
+                <CircularProgress size={24} sx={{ mr: 1 }} />
+                <Typography color="text.secondary">
+                  Loading messages...
+                </Typography>
+              </Box>
+            ) : messages.length === 0 && (activeUser || activeRoom) ? (
+              <Box
+                sx={{
+                  height: "100%",
+                  display: "flex",
+                  justifyContent: "center",
+                  alignItems: "center",
+                }}
+              >
+                <Typography color="text.secondary">
+                  No messages yet. Start the conversation! 💬
+                </Typography>
+              </Box>
+            ) : (
+              <Stack spacing={1.5}>
+                {messages.map((msg) => {
+                  const isMe = msg.from === user._id;
+                  const time = new Date(msg.createdAt).toLocaleTimeString([], {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  });
+
+                  const senderName =
+                    msg.fromUsername ||
+                    (isMe
+                      ? user.username
+                      : activeUser?.username || "User");
+
+                  return (
+                    <Box
+                      key={msg._id}
+                      sx={{
+                        display: "flex",
+                        justifyContent: isMe ? "flex-end" : "flex-start",
+                      }}
+                    >
+                      <Box
+                        sx={{
+                          maxWidth: "65%",
+                          bgcolor: isMe ? "primary.light" : "background.paper",
+                          borderRadius: isMe
+                            ? "16px 16px 4px 16px"
+                            : "16px 16px 16px 4px",
+                          boxShadow: 1,
+                          p: 1.5,
+                        }}
+                      >
+                        {activeRoom && !isMe && (
+                          <Typography
+                            variant="caption"
+                            fontWeight={700}
+                            sx={{
+                              color: stringToColor(senderName),
+                              display: "block",
+                              mb: 0.3,
+                            }}
+                          >
+                            {senderName}
+                          </Typography>
+                        )}
+                        <Typography variant="body1" color="text.primary">
+                          {msg.content}
+                        </Typography>
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            float: "right",
+                            mt: 0.5,
+                            color: "text.secondary",
+                            fontSize: "0.7rem",
+                          }}
+                        >
+                          {time}
+                        </Typography>
+                      </Box>
+                    </Box>
+                  );
+                })}
+                <div ref={messagesEndRef} />
+              </Stack>
+            )}
+          </Box>
+
+          {/* Input */}
+          {(activeUser || activeRoom) && (
+            <Box
+              component="form"
+              onSubmit={handleSendMessage}
+              sx={{
+                p: 2,
+                borderTop: "1px solid",
+                borderColor: "divider",
+                bgcolor: "background.paper",
+              }}
+            >
+              <Stack direction="row" spacing={1} alignItems="center">
+                <TextField
+                  fullWidth
+                  variant="outlined"
+                  size="medium"
+                  placeholder="Type a message..."
+                  value={messageInput}
+                  onChange={(e) => setMessageInput(e.target.value)}
+                  sx={{
+                    "& fieldset": { borderRadius: 30 },
+                  }}
+                  autoFocus
+                />
+                <Button
+                  type="submit"
+                  variant="contained"
+                  endIcon={<SendIcon />}
+                  disabled={!messageInput.trim()}
+                  sx={{
+                    borderRadius: 30,
+                    minWidth: 100,
+                    px: 2,
+                  }}
+                >
+                  Send
+                </Button>
+              </Stack>
+            </Box>
+          )}
+        </Box>
+      </Box>
+    </Box>
   );
 }
-
-const styles = {
-  app: { display: "flex", height: "100vh", fontFamily: "sans-serif" },
-  sidebar: { width: 260, borderRight: "1px solid #ddd", display: "flex", flexDirection: "column" },
-  loginForm: { padding: 10, display: "flex", flexDirection: "column", gap: 8 },
-  userBox: { padding: 10, borderBottom: "1px solid #ddd" },
-  usersList: { flex: 1, overflowY: "auto" },
-  userItem: { padding: "8px 10px", cursor: "pointer", borderBottom: "1px solid #eee" },
-  main: { flex: 1, display: "flex", flexDirection: "column" },
-  chatHeader: { padding: 10, borderBottom: "1px solid #ddd", backgroundColor: "#f7f7f7" },
-  chatArea: { flex: 1, padding: 10, display: "flex", flexDirection: "column", gap: 6, overflowY: "auto" },
-  messageForm: { display: "flex", gap: 8, padding: 10, borderTop: "1px solid #ddd" },
-  input: { flex: 1, padding: "8px 10px", borderRadius: 4, border: "1px solid #ccc" },
-  button: { padding: "8px 14px", borderRadius: 4, border: "none", backgroundColor: "#007bff", color: "#fff", cursor: "pointer" },
-  centerMessage: { flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#777" },
-  message: { maxWidth: "70%", padding: "6px 8px", borderRadius: 6 },
-};
 
 export default App;
