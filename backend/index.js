@@ -1,25 +1,26 @@
-// backend/index.js
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const mongoose = require("mongoose");
 const cors = require("cors");
+const jwt = require("jsonwebtoken");
 
 // Models
 const User = require("./models/user");
 const Message = require("./models/message");
 const Room = require("./models/room");
 
+const authRoutes = require("./routes/auth");
+const authMiddleware = require("./middleware/auth");
+
 const app = express();
 const server = http.createServer(app);
 
-/* ---------------------------------------------
-   CORS CONFIG — FIXES 5173 / 5174 / 5175 ISSUES
---------------------------------------------- */
+/* CORS */
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin) return callback(null, true); // allow backend tools
+    if (!origin) return callback(null, true);
     if (
       origin.startsWith("http://localhost") ||
       origin.startsWith("http://127.0.0.1")
@@ -35,61 +36,31 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json());
 
-/* ---------------------------------------------
-   SOCKET.IO WITH SAME CORS SETTINGS
---------------------------------------------- */
-const io = new Server(server, {
-  cors: corsOptions,
-});
-
-/* ---------------------------------------------
-   MONGODB CONNECTION (Compass Compatible)
---------------------------------------------- */
-
-// Works with Compass: ensure Compass uses the SAME URI!
-// If no .env, defaults to local MongoDB
+/* MONGO */
 const MONGO_URI =
   process.env.MONGO_URI || "mongodb://127.0.0.1:27017/chatapp";
 
 mongoose
   .connect(MONGO_URI)
-  .then(() =>
-    console.log("MongoDB connected →", MONGO_URI)
-  )
+  .then(() => console.log("MongoDB connected →", MONGO_URI))
   .catch((err) => console.error("MongoDB error:", err));
 
-/* ---------------------------------------------
-   USERS (login or auto-create)
---------------------------------------------- */
-app.post("/api/users", async (req, res) => {
-  try {
-    const { username } = req.body;
-    if (!username) return res.status(400).json({ error: "Username required" });
+/* AUTH ROUTES */
+app.use("/api/auth", authRoutes);
 
-    let user = await User.findOne({ username });
-
-    if (!user) {
-      user = await User.create({ username });
-      console.log("New user created:", user.username);
-    } else {
-      console.log("User logged in:", user.username);
-    }
-
-    res.json(user);
-  } catch (err) {
-    console.error("POST /api/users error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-/* ---------------------------------------------
-   FETCH PRIVATE MESSAGES
---------------------------------------------- */
-app.get("/api/messages", async (req, res) => {
+/* PROTECTED / PUBLIC API EXAMPLES */
+// If you want to protect messages route, add authMiddleware as shown
+// Example: protect private messages route
+app.get("/api/messages", authMiddleware, async (req, res) => {
   try {
     const { from, to } = req.query;
     if (!from || !to)
       return res.status(400).json({ error: "from & to required" });
+
+    // Optionally ensure req.user.userId equals `from` or that user is allowed
+    if (req.user.userId !== from && req.user.userId !== to) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
 
     const messages = await Message.find({
       $or: [{ from, to }, { from: to, to: from }],
@@ -102,10 +73,8 @@ app.get("/api/messages", async (req, res) => {
   }
 });
 
-/* ---------------------------------------------
-   FETCH ROOM MESSAGES
---------------------------------------------- */
-app.get("/api/messages/room/:roomId", async (req, res) => {
+// Room messages can be protected similarly:
+app.get("/api/messages/room/:roomId", authMiddleware, async (req, res) => {
   try {
     const { roomId } = req.params;
 
@@ -129,10 +98,8 @@ app.get("/api/messages/room/:roomId", async (req, res) => {
   }
 });
 
-/* ---------------------------------------------
-   CREATE ROOM
---------------------------------------------- */
-app.post("/api/rooms", async (req, res) => {
+/* Room creation - protect */
+app.post("/api/rooms", authMiddleware, async (req, res) => {
   try {
     const { name, members } = req.body;
     if (!name) return res.status(400).json({ error: "Room name required" });
@@ -146,10 +113,7 @@ app.post("/api/rooms", async (req, res) => {
   }
 });
 
-/* ---------------------------------------------
-   GET ALL ROOMS
---------------------------------------------- */
-app.get("/api/rooms", async (req, res) => {
+app.get("/api/rooms", authMiddleware, async (req, res) => {
   try {
     const rooms = await Room.find().lean();
     res.json(rooms);
@@ -159,78 +123,90 @@ app.get("/api/rooms", async (req, res) => {
   }
 });
 
-/* ---------------------------------------------
-   SOCKET.IO AUTH STORAGE
---------------------------------------------- */
-const onlineUsers = new Map(); // userId → socketId
-
-io.use((socket, next) => {
-  const { userId, username } = socket.handshake.auth;
-  if (!userId || !username)
-    return next(new Error("Invalid socket auth"));
-
-  socket.userId = userId;
-  socket.username = username;
-  next();
+/* SOCKET.IO */
+const io = new Server(server, {
+  cors: corsOptions,
 });
 
-/* ---------------------------------------------
-   SOCKET.IO EVENTS
---------------------------------------------- */
+// map userId -> socketId
+const onlineUsers = new Map();
+
+const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
+
+// Socket auth via token in handshake auth: { token: "..." }
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth && socket.handshake.auth.token;
+    if (!token) return next(new Error("Authentication error: token required"));
+
+    const payload = jwt.verify(token, JWT_SECRET);
+    socket.userId = payload.userId;
+    socket.username = payload.username;
+    return next();
+  } catch (err) {
+    console.error("Socket auth error:", err);
+    return next(new Error("Authentication error"));
+  }
+});
+
 io.on("connection", (socket) => {
   console.log("User connected:", socket.username);
 
   onlineUsers.set(socket.userId, socket.id);
-
   broadcastOnlineUsers();
 
   // PRIVATE MESSAGE
   socket.on("privateMessage", async ({ toUserId, content }) => {
-    if (!content.trim()) return;
+    if (!content || !content.trim()) return;
+    try {
+      const msg = await Message.create({
+        from: socket.userId,
+        to: toUserId,
+        content,
+      });
 
-    const msg = await Message.create({
-      from: socket.userId,
-      to: toUserId,
-      content,
-    });
+      const payload = {
+        _id: msg._id,
+        from: socket.userId,
+        to: toUserId,
+        content: msg.content,
+        createdAt: msg.createdAt,
+      };
 
-    const payload = {
-      _id: msg._id,
-      from: socket.userId,
-      to: toUserId,
-      content: msg.content,
-      createdAt: msg.createdAt,
-    };
+      socket.emit("privateMessage", payload);
 
-    socket.emit("privateMessage", payload);
-
-    if (onlineUsers.has(toUserId)) {
-      io.to(onlineUsers.get(toUserId)).emit("privateMessage", payload);
+      if (onlineUsers.has(toUserId)) {
+        io.to(onlineUsers.get(toUserId)).emit("privateMessage", payload);
+      }
+    } catch (err) {
+      console.error("privateMessage error:", err);
     }
   });
 
   // ROOM MESSAGE
   socket.on("roomMessage", async ({ roomId, content }) => {
-    if (!content.trim()) return;
+    if (!content || !content.trim()) return;
+    try {
+      const msg = await Message.create({
+        from: socket.userId,
+        room: roomId,
+        content,
+      });
 
-    const msg = await Message.create({
-      from: socket.userId,
-      room: roomId,
-      content,
-    });
+      const payload = {
+        _id: msg._id,
+        from: socket.userId,
+        content: msg.content,
+        roomId,
+        createdAt: msg.createdAt,
+      };
 
-    const payload = {
-      _id: msg._id,
-      from: socket.userId,
-      content: msg.content,
-      roomId,
-      createdAt: msg.createdAt,
-    };
-
-    io.to(roomId).emit("roomMessage", payload);
+      io.to(roomId).emit("roomMessage", payload);
+    } catch (err) {
+      console.error("roomMessage error:", err);
+    }
   });
 
-  // JOIN ROOM
   socket.on("joinRoom", (roomId) => {
     socket.join(roomId);
   });
@@ -242,9 +218,6 @@ io.on("connection", (socket) => {
   });
 });
 
-/* ---------------------------------------------
-   BROADCAST ONLINE USERS
---------------------------------------------- */
 function broadcastOnlineUsers() {
   const list = [];
 
@@ -256,9 +229,7 @@ function broadcastOnlineUsers() {
   io.emit("onlineUsers", list);
 }
 
-/* ---------------------------------------------
-   START SERVER
---------------------------------------------- */
+/* START SERVER */
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () =>
   console.log(`Server running at http://localhost:${PORT}`)

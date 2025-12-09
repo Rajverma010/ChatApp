@@ -1,4 +1,3 @@
-// frontend/src/App.jsx
 import React, { useEffect, useState, useRef, useMemo } from "react";
 import { io } from "socket.io-client";
 import axios from "axios";
@@ -29,9 +28,10 @@ import { ThemeProvider, createTheme } from "@mui/material/styles";
 import SendIcon from "@mui/icons-material/Send";
 import AddIcon from "@mui/icons-material/Add";
 import GroupIcon from "@mui/icons-material/Group";
+import LogoutIcon from "@mui/icons-material/Logout";
 
 const API_BASE = "http://localhost:4000";
-const socket = io(API_BASE, { autoConnect: false });
+const socket = io(API_BASE, { autoConnect: false, transports: ["websocket"] });
 
 // Helper to generate a consistent color for user avatars
 const stringToColor = (string = "") => {
@@ -48,9 +48,37 @@ const stringToColor = (string = "") => {
   return color;
 };
 
-/**
- * Outer App: handles theme & full-screen layout
- */
+/* ----------------- Diagnostics (useful while debugging) ----------------- */
+// Attach axios interceptor so requests log and Authorization header can be injected later
+axios.interceptors.request.use(
+  (cfg) => {
+    try {
+      // if you store token in localStorage under "chatapp_auth_v1", attach it automatically:
+      const raw = localStorage.getItem("chatapp_auth_v1");
+      if (raw) {
+        const { token } = JSON.parse(raw);
+        if (token) cfg.headers.Authorization = `Bearer ${token}`;
+      }
+    } catch (e) {}
+    return cfg;
+  },
+  (err) => {
+    console.error("axios request error", err);
+    return Promise.reject(err);
+  }
+);
+
+axios.interceptors.response.use(
+  (r) => r,
+  (err) => {
+    console.error("axios response error", err?.response || err);
+    // optional: auto logout on 401
+    // if (err?.response?.status === 401) { localStorage.removeItem("chatapp_auth_v1"); window.location.reload(); }
+    return Promise.reject(err);
+  }
+);
+/* ----------------------------------------------------------------------- */
+
 function App() {
   // auto detect system theme
   const prefersDarkMode = useMediaQuery("(prefers-color-scheme: dark)");
@@ -80,12 +108,10 @@ function App() {
   );
 }
 
-/**
- * Inner component: your original chat logic + UI
- */
 function ChatApp() {
   const [user, setUser] = useState(null); // {_id, username}
   const [usernameInput, setUsernameInput] = useState("");
+  const [passwordInput, setPasswordInput] = useState("");
   const [onlineUsers, setOnlineUsers] = useState([]); // [{userId, username}]
 
   const [activeUser, setActiveUser] = useState(null); // private chat target
@@ -106,11 +132,61 @@ function ChatApp() {
   };
   useEffect(scrollToBottom, [messages]);
 
+  // Restore session on mount (if token present)
+  useEffect(() => {
+    const restore = async () => {
+      try {
+        const raw = localStorage.getItem("chatapp_auth_v1");
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        if (!parsed) return;
+
+        if (parsed.token) {
+          // try to validate token on server
+          try {
+            const res = await axios.get(`${API_BASE}/api/auth/me`);
+            // expected: res.data => user object
+            if (res?.data) {
+              setUser(res.data);
+              return;
+            }
+          } catch (err) {
+            // server may not provide /api/auth/me — fallback to stored user
+            console.warn("auth/me failed, falling back to stored user");
+            if (parsed.user) setUser(parsed.user);
+          }
+        } else if (parsed.user) {
+          setUser(parsed.user);
+        }
+      } catch (err) {
+        console.warn("Session restore failed", err);
+        localStorage.removeItem("chatapp_auth_v1");
+      }
+    };
+    restore();
+  }, []);
+
   // ------------------ SOCKET SETUP ------------------
   useEffect(() => {
     if (!user) return;
 
-    socket.auth = { userId: user._id, username: user.username };
+    // send token-based auth when using JWT; your current backend expects { token }.
+    // if you're still using socket auth with { userId, username } (legacy), keep that.
+    // Here I set token if present in localStorage, otherwise fallback to user object:
+    const stored = (() => {
+      try {
+        return JSON.parse(localStorage.getItem("chatapp_auth_v1"));
+      } catch {
+        return null;
+      }
+    })();
+
+    if (stored?.token) {
+      socket.auth = { token: stored.token };
+    } else {
+      socket.auth = { userId: user._id, username: user.username };
+    }
+
     socket.connect();
 
     socket.on("onlineUsers", setOnlineUsers);
@@ -130,29 +206,143 @@ function ChatApp() {
       }
     });
 
+    socket.on("connect_error", (err) => {
+      console.error("Socket connect_error (client):", err);
+    });
+
     return () => {
       socket.off("onlineUsers");
       socket.off("privateMessage");
       socket.off("roomMessage");
+      socket.off("connect_error");
       socket.disconnect();
     };
   }, [user, activeUser, activeRoom]);
 
   // ------------------ LOGIN ------------------
-  const handleLogin = async (e) => {
-    e.preventDefault();
-    const trimmed = usernameInput.trim();
-    if (!trimmed) return;
+const handleLogin = async (e) => {
+  e?.preventDefault?.();
+  const username = usernameInput.trim();
+  const password = passwordInput;
+  if (!username || !password) {
+    alert("Please enter username and password");
+    return;
+  }
 
-    try {
-      const res = await axios.post(`${API_BASE}/api/users`, {
-        username: trimmed,
-      });
-      setUser(res.data);
-    } catch (err) {
-      console.error(err);
-      alert("Error logging in/creating user");
+  try {
+    // NOTE: backend expects "identifier" (username or email)
+    const res = await axios.post(`${API_BASE}/api/auth/login`, {
+      identifier: username,
+      password,
+    });
+
+    if (res?.data?.token && res?.data?.user) {
+      localStorage.setItem(
+        "chatapp_auth_v1",
+        JSON.stringify({ token: res.data.token, user: res.data.user })
+      );
+      setUser(res.data.user);
+      setUsernameInput("");
+      setPasswordInput("");
+      return;
     }
+
+    console.warn("Login response unexpected:", res?.data);
+    alert("Login succeeded but server response is unexpected.");
+  } catch (err) {
+    console.warn("Login failed, attempting to register...", err?.response?.status, err?.response?.data);
+
+    const status = err?.response?.status;
+
+    // If credentials invalid / user missing (401) -> try to register automatically
+    if (status === 401 || status === 400) {
+      try {
+        const reg = await axios.post(`${API_BASE}/api/auth/register`, {
+          username,
+          password,
+        });
+
+        if (reg?.data?.token && reg?.data?.user) {
+          localStorage.setItem(
+            "chatapp_auth_v1",
+            JSON.stringify({ token: reg.data.token, user: reg.data.user })
+          );
+          setUser(reg.data.user);
+          setUsernameInput("");
+          setPasswordInput("");
+          alert("Account created and logged in.");
+          return;
+        }
+
+        console.warn("Register response unexpected:", reg?.data);
+        alert("Registration unexpectedly succeeded but response is odd.");
+      } catch (regErr) {
+        console.error("Auto-register failed:", regErr?.response || regErr);
+        // show the server message if present
+        const msg = regErr?.response?.data?.error || regErr?.response?.data?.message;
+        alert("Register failed: " + (msg || regErr.message || "unknown"));
+      }
+      return;
+    }
+
+    // Other errors: show a helpful message
+    if (status === 404) {
+      alert("Login endpoint not found. Check backend routes.");
+    } else {
+      alert(err?.response?.data?.message || err.message || "Login failed");
+    }
+  }
+};
+
+
+  // ------------------ REGISTER ------------------
+  const handleRegister = async (e) => {
+    if (e?.preventDefault) e.preventDefault();
+    const username = usernameInput.trim();
+    const password = passwordInput;
+    if (!username || !password) {
+      alert("Please enter username and password to register");
+      return;
+    }
+    try {
+      const res = await axios.post(`${API_BASE}/api/auth/register`, {
+        username,
+        password,
+      });
+      if (res?.data?.token && res?.data?.user) {
+        localStorage.setItem(
+          "chatapp_auth_v1",
+          JSON.stringify({ token: res.data.token, user: res.data.user })
+        );
+        setUser(res.data.user);
+        setUsernameInput("");
+        setPasswordInput("");
+        return;
+      }
+      console.warn("Register response unexpected:", res?.data);
+      alert("Registered but response format is unexpected.");
+    } catch (err) {
+      console.error("Register error:", err?.response || err);
+      const status = err?.response?.status;
+      if (status === 400) alert("Bad request: " + JSON.stringify(err.response.data));
+      else if (status === 404) alert("Register endpoint not found. Check backend routes.");
+      else alert(err?.response?.data?.message || err.message || "Register failed");
+    }
+  };
+
+  // ------------------ LOGOUT ------------------
+  const handleLogout = () => {
+    try {
+      localStorage.removeItem("chatapp_auth_v1");
+    } catch {}
+    try {
+      socket.disconnect();
+    } catch {}
+    setUser(null);
+    setActiveRoom(null);
+    setActiveUser(null);
+    setRooms([]);
+    setMessages([]);
   };
 
   // ------------------ LOAD ROOMS ------------------
@@ -253,7 +443,7 @@ function ChatApp() {
 
   // ------------------ JOIN ROOM (SOCKET) ------------------
   useEffect(() => {
-    if (activeRoom) {
+    if (activeRoom && socket.connected) {
       socket.emit("joinRoom", activeRoom._id);
     }
   }, [activeRoom]);
@@ -301,6 +491,15 @@ function ChatApp() {
             margin="normal"
             autoFocus
           />
+          <TextField
+            label="Password (optional)"
+            variant="outlined"
+            fullWidth
+            type="password"
+            value={passwordInput}
+            onChange={(e) => setPasswordInput(e.target.value)}
+            margin="normal"
+          />
           <Button
             type="submit"
             variant="contained"
@@ -329,6 +528,9 @@ function ChatApp() {
             <Typography variant="body1" color="inherit">
               {user.username}
             </Typography>
+            <IconButton color="inherit" onClick={handleLogout} aria-label="logout">
+              <LogoutIcon />
+            </IconButton>
           </Stack>
         </Toolbar>
       </AppBar>
@@ -373,10 +575,7 @@ function ChatApp() {
                       },
                     }}
                   >
-                    <GroupIcon
-                      fontSize="small"
-                      sx={{ mr: 1, opacity: 0.8 }}
-                    />
+                    <GroupIcon fontSize="small" sx={{ mr: 1, opacity: 0.8 }} />
                     <ListItemText
                       primary={r.name || "Unnamed room"}
                       primaryTypographyProps={{ color: "text.primary" }}
@@ -563,9 +762,7 @@ function ChatApp() {
 
                   const senderName =
                     msg.fromUsername ||
-                    (isMe
-                      ? user.username
-                      : activeUser?.username || "User");
+                    (isMe ? user.username : activeUser?.username || "User");
 
                   return (
                     <Box
